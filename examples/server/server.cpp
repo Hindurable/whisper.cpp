@@ -3,6 +3,7 @@
 #include "whisper.h"
 #include "httplib.h"
 #include "json.hpp"
+#include "websocket_handler.h"
 
 #include <cmath>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <vector>
 #include <cstring>
 #include <sstream>
+#include <boost/asio/io_context.hpp>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -35,8 +37,10 @@ struct server_params
     std::string public_path = "examples/server/public";
     std::string request_path = "";
     std::string inference_path = "/inference";
+    std::string websocket_path = "/ws";
 
     int32_t port          = 8080;
+    int32_t ws_port       = 8081;
     int32_t read_timeout  = 600;
     int32_t write_timeout = 600;
 
@@ -92,6 +96,11 @@ struct whisper_params {
     std::string openvino_encode_device = "CPU";
 
     std::string dtw = "";
+
+    float silence_threshold = -40.0f;
+    float min_audio_level = -60.0f;
+    float silence_duration = 0.5f;
+    float min_audio_duration = 2.0f;
 };
 
 void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params, const server_params& sparams) {
@@ -118,7 +127,9 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -tr,       --translate         [%-7s] translate from source language to english\n",      params.translate ? "true" : "false");
     fprintf(stderr, "  -di,       --diarize           [%-7s] stereo audio diarization\n",                       params.diarize ? "true" : "false");
     fprintf(stderr, "  -tdrz,     --tinydiarize       [%-7s] enable tinydiarize (requires a tdrz model)\n",     params.tinydiarize ? "true" : "false");
+    fprintf(stderr, "  -sow,      --split-on-word     [%-7s] split on word rather than on token\n",             params.split_on_word ? "true" : "false");
     fprintf(stderr, "  -nf,       --no-fallback       [%-7s] do not use temperature fallback while decoding\n", params.no_fallback ? "true" : "false");
+    fprintf(stderr, "  -fp,       --font-path         [%-7s] path to font file\n",                              params.font_path.c_str());
     fprintf(stderr, "  -ps,       --print-special     [%-7s] print special tokens\n",                           params.print_special ? "true" : "false");
     fprintf(stderr, "  -pc,       --print-colors      [%-7s] print colors\n",                                   params.print_colors ? "true" : "false");
     fprintf(stderr, "  -pr,       --print-realtime    [%-7s] print output in realtime\n",                       params.print_realtime ? "true" : "false");
@@ -133,12 +144,17 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -dtw MODEL --dtw MODEL         [%-7s] compute token-level timestamps\n", params.dtw.c_str());
     fprintf(stderr, "  --host HOST,                   [%-7s] Hostname/ip-adress for the server\n", sparams.hostname.c_str());
     fprintf(stderr, "  --port PORT,                   [%-7d] Port number for the server\n", sparams.port);
+    fprintf(stderr, "  --ws-port PORT,                [%-7d] WebSocket port number for the server\n", sparams.ws_port);
     fprintf(stderr, "  --public PATH,                 [%-7s] Path to the public folder\n", sparams.public_path.c_str());
     fprintf(stderr, "  --request-path PATH,           [%-7s] Request path for all requests\n", sparams.request_path.c_str());
     fprintf(stderr, "  --inference-path PATH,         [%-7s] Inference path for all requests\n", sparams.inference_path.c_str());
     fprintf(stderr, "  --convert,                     [%-7s] Convert audio to WAV, requires ffmpeg on the server\n", sparams.ffmpeg_converter ? "true" : "false");
     fprintf(stderr, "  -sns,      --suppress-nst      [%-7s] suppress non-speech tokens\n", params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  -nth N,    --no-speech-thold N [%-7.2f] no speech threshold\n",   params.no_speech_thold);
+    fprintf(stderr, "  --st N,    --silence-threshold N [%-7.2f] silence threshold in dB\n", params.silence_threshold);
+    fprintf(stderr, "  --mal N,   --min-audio-level N [%-7.2f] minimum audio level in dB\n", params.min_audio_level);
+    fprintf(stderr, "  --sd N,    --silence-duration N [%-7.2f] silence duration in seconds\n", params.silence_duration);
+    fprintf(stderr, "  --mad N,   --min-audio-duration N [%-7.2f] minimum audio duration in seconds\n", params.min_audio_duration);
     fprintf(stderr, "\n");
 }
 
@@ -185,6 +201,10 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (arg == "-fa"   || arg == "--flash-attn")      { params.flash_attn      = true; }
         else if (arg == "-sns"  || arg == "--suppress-nst")    { params.suppress_nst    = true; }
         else if (arg == "-nth"  || arg == "--no-speech-thold") { params.no_speech_thold = std::stof(argv[++i]); }
+        else if (arg == "--st"  || arg == "--silence-threshold") { params.silence_threshold = std::stof(argv[++i]); }
+        else if (arg == "--mal" || arg == "--min-audio-level") { params.min_audio_level = std::stof(argv[++i]); }
+        else if (arg == "--sd"  || arg == "--silence-duration") { params.silence_duration = std::stof(argv[++i]); }
+        else if (arg == "--mad" || arg == "--min-audio-duration") { params.min_audio_duration = std::stof(argv[++i]); }
 
         // server params
         else if (                  arg == "--port")            { sparams.port        = std::stoi(argv[++i]); }
@@ -193,6 +213,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (                  arg == "--request-path")    { sparams.request_path = argv[++i]; }
         else if (                  arg == "--inference-path")  { sparams.inference_path = argv[++i]; }
         else if (                  arg == "--convert")         { sparams.ffmpeg_converter     = true; }
+        else if (                  arg == "--ws-port")         { sparams.ws_port     = std::stoi(argv[++i]); }
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             whisper_print_usage(argc, argv, params, sparams);
@@ -596,10 +617,13 @@ int main(int argc, char ** argv) {
     whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
 
     Server svr;
-    svr.set_default_headers({{"Server", "whisper.cpp"},
-                             {"Access-Control-Allow-Origin", "*"},
-                             {"Access-Control-Allow-Headers", "content-type, authorization"}});
 
+    // Set default headers
+    svr.set_default_headers({{"Server", "whisper.cpp"},
+                           {"Access-Control-Allow-Origin", "*"},
+                           {"Access-Control-Allow-Headers", "content-type, authorization"}});
+
+    // Define default HTML content
     std::string const default_content = R"(
     <html>
     <head>
@@ -789,7 +813,6 @@ int main(int argc, char ** argv) {
             wparams.print_special    = params.print_special;
             wparams.translate        = params.translate;
             wparams.language         = params.language.c_str();
-            wparams.detect_language  = params.detect_language;
             wparams.n_threads        = params.n_threads;
             wparams.n_max_text_ctx   = params.max_context >= 0 ? params.max_context : wparams.n_max_text_ctx;
             wparams.offset_ms        = params.offset_t_ms;
@@ -984,6 +1007,7 @@ int main(int argc, char ** argv) {
         // reset params to their defaults
         params = default_params;
     });
+
     svr.Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
         std::lock_guard<std::mutex> lock(whisper_mutex);
         if (!req.has_file("model"))
@@ -1046,28 +1070,57 @@ int main(int argc, char ** argv) {
         }
     });
 
-    // set timeouts and change hostname and port
+    // Set the base directory for serving static files
+    auto ret = svr.set_mount_point("/", sparams.public_path);
+    if (!ret) {
+        fprintf(stderr, "\n%s: error: failed to mount static files directory: %s\n", argv[0], sparams.public_path.c_str());
+        return 1;
+    }
+
+    // Initialize whisper parameters for WebSocket
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    wparams.print_realtime   = true;
+    wparams.print_progress   = params.print_progress;
+    wparams.print_timestamps = !params.no_timestamps;
+    wparams.print_special    = params.print_special;
+    wparams.translate       = params.translate;
+    wparams.language        = params.language.c_str();
+    wparams.n_threads       = params.n_threads;
+
+    // Start WebSocket server in a separate thread
+    boost::asio::io_context ioc;
+    std::thread ws_thread([&ioc, &sparams, &ctx, &wparams]() {
+        try {
+            fprintf(stderr, "Starting WebSocket server on port %d...\n", sparams.ws_port);
+            start_websocket_server(ioc, sparams.ws_port, ctx, wparams);
+            fprintf(stderr, "Running WebSocket io_context...\n");
+            ioc.run();
+            fprintf(stderr, "WebSocket io_context finished\n");
+        } catch (const std::exception& e) {
+            fprintf(stderr, "WebSocket server error: %s\n", e.what());
+        }
+    });
+
+    // Configure and start HTTP server
     svr.set_read_timeout(sparams.read_timeout);
     svr.set_write_timeout(sparams.write_timeout);
 
-    if (!svr.bind_to_port(sparams.hostname, sparams.port))
-    {
-        fprintf(stderr, "\ncouldn't bind to server socket: hostname=%s port=%d\n\n",
-                sparams.hostname.c_str(), sparams.port);
+    fprintf(stderr, "\nwhisper server listening at http://%s:%d\n", sparams.hostname.c_str(), sparams.port);
+
+    // Start the HTTP server (this blocks until server is stopped)
+    if (!svr.listen(sparams.hostname.c_str(), sparams.port)) {
+        fprintf(stderr, "Failed to start HTTP server\n");
         return 1;
     }
 
-    // Set the base directory for serving static files
-    svr.set_base_dir(sparams.public_path);
-
-    // to make it ctrl+clickable:
-    printf("\nwhisper server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
-
-    if (!svr.listen_after_bind())
-    {
-        return 1;
+    // When HTTP server stops, stop WebSocket server and wait for thread to finish
+    fprintf(stderr, "Stopping WebSocket server...\n");
+    ioc.stop();
+    if (ws_thread.joinable()) {
+        ws_thread.join();
     }
 
+    // Clean up
     whisper_print_timings(ctx);
     whisper_free(ctx);
 
