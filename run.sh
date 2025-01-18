@@ -1,6 +1,6 @@
 #!/bin/bash
 
-./build/bin/whisper-server \
+./build/bin/server \
   --model models/ggml-large-v3-turbo.bin \
   --language fi \
   --host 0.0.0.0 \

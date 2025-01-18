@@ -10,8 +10,9 @@
 #include <vector>
 #include <deque>
 #include <iostream>
-
 #include "whisper.h"
+
+using namespace std;
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;

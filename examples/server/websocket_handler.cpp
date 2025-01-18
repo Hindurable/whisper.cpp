@@ -61,7 +61,7 @@ void Listener::on_accept(beast::error_code ec, tcp::socket socket) {
         auto session = std::make_shared<WebSocketSession>(std::move(socket), ctx_, params_);
         session->processor().update_config(config_);  // Set initial config from command line
         session->run();
-        fprintf(stderr, "Client connected to WebSocket server\n");
+        std::cerr << "Client connected to WebSocket server" << std::endl;
     }
 
     do_accept();
@@ -78,8 +78,8 @@ WebSocketSession::WebSocketSession(tcp::socket socket, whisper_context* ctx, whi
 }
 
 WebSocketSession::~WebSocketSession() {
-    fprintf(stderr, "Client disconnected from WebSocket server [%s]\n", 
-            client_endpoint_.address().to_string().c_str());
+    std::cerr << "Client disconnected from WebSocket server [" 
+              << client_endpoint_.address().to_string() << "]" << std::endl;
 }
 
 void WebSocketSession::run() {
@@ -88,8 +88,8 @@ void WebSocketSession::run() {
             res.set(beast::http::field::server, "Whisper WebSocket Server");
         }));
 
-    fprintf(stderr, "New WebSocket connection from %s\n", 
-            client_endpoint_.address().to_string().c_str());
+    std::cerr << "New WebSocket connection from " 
+              << client_endpoint_.address().to_string() << std::endl;
 
     ws_.async_accept(beast::bind_front_handler(&WebSocketSession::on_accept, shared_from_this()));
 }
@@ -156,45 +156,78 @@ std::vector<float> AudioProcessor::convert_pcm16_to_float(const int16_t* samples
 }
 
 bool AudioProcessor::parse_config_message(const std::string& message) {
-    if (message.size() > 2 && message[0] == '{') {
-        // Parse audio format
-        if (message.find("\"format\":\"pcm16\"") != std::string::npos) {
+    try {
+        // Basic JSON validation
+        if (message.empty() || message[0] != '{' || message.back() != '}') {
+            return false;
+        }
+
+        auto extract_value = [](const std::string& msg, const std::string& key) -> std::pair<bool, std::string> {
+            std::string search = "\"" + key + "\":";
+            size_t start = msg.find(search);
+            if (start == std::string::npos) {
+                return {false, ""};
+            }
+            start += search.length();
+            
+            // Skip whitespace
+            while (start < msg.length() && std::isspace(msg[start])) {
+                start++;
+            }
+
+            // Handle string values
+            if (start < msg.length() && msg[start] == '"') {
+                start++;
+                size_t end = msg.find('"', start);
+                if (end == std::string::npos) return {false, ""};
+                return {true, msg.substr(start, end - start)};
+            }
+            
+            // Handle numeric values
+            size_t end = start;
+            while (end < msg.length() && (std::isdigit(msg[end]) || msg[end] == '.' || msg[end] == '-')) {
+                end++;
+            }
+            if (end > start) {
+                return {true, msg.substr(start, end - start)};
+            }
+            
+            return {false, ""};
+        };
+
+        // Parse format
+        auto [format_found, format] = extract_value(message, "format");
+        if (!format_found) {
+            return false;
+        }
+
+        if (format == "pcm16") {
             format_ = AudioFormat::PCM_INT16;
-        } else if (message.find("\"format\":\"float32\"") != std::string::npos) {
+        } else if (format == "float32") {
             format_ = AudioFormat::PCM_FLOAT32;
         }
 
-        // Parse silence threshold
-        size_t pos = message.find("\"silence_threshold\":");
-        if (pos != std::string::npos) {
-            pos += 19; // Length of "silence_threshold":
-            config_.silence_threshold = std::stof(message.substr(pos));
-        }
+        // Parse config values
+        auto parse_float = [](const std::pair<bool, std::string>& result, float& target) {
+            if (result.first) {
+                try {
+                    target = std::stof(result.second);
+                } catch (...) {
+                    // Keep existing value if parsing fails
+                }
+            }
+        };
 
-        // Parse minimum audio level
-        pos = message.find("\"min_audio_level\":");
-        if (pos != std::string::npos) {
-            pos += 17; // Length of "min_audio_level":
-            config_.min_audio_level = std::stof(message.substr(pos));
-        }
-
-        // Parse silence duration
-        pos = message.find("\"silence_duration\":");
-        if (pos != std::string::npos) {
-            pos += 18; // Length of "silence_duration":
-            config_.silence_duration = std::stof(message.substr(pos));
-        }
-
-        // Parse minimum audio duration
-        pos = message.find("\"min_audio_duration\":");
-        if (pos != std::string::npos) {
-            pos += 20; // Length of "min_audio_duration":
-            config_.min_audio_duration = std::stof(message.substr(pos));
-        }
+        parse_float(extract_value(message, "silence_threshold"), config_.silence_threshold);
+        parse_float(extract_value(message, "min_audio_level"), config_.min_audio_level);
+        parse_float(extract_value(message, "silence_duration"), config_.silence_duration);
+        parse_float(extract_value(message, "min_audio_duration"), config_.min_audio_duration);
 
         return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Error parsing config: " << e.what() << std::endl;
+        return false;
     }
-    return false;
 }
 
 void AudioProcessor::process_binary(const std::string& message, websocket::stream<tcp::socket>& ws) {
@@ -212,6 +245,8 @@ void AudioProcessor::process_binary(const std::string& message, websocket::strea
             ",\"min_audio_duration\":" + std::to_string(config_.min_audio_duration) +
             "}}";
         ws.write(boost::asio::buffer(response), ec);
+        std::cerr << "Received client settings: " << message << std::endl;
+        std::cerr << "Sent acknowledgment: " << response << std::endl;
         return;
     }
 
@@ -232,14 +267,31 @@ void AudioProcessor::process_binary(const std::string& message, websocket::strea
     buffer_.insert(buffer_.end(), new_samples.begin(), new_samples.end());
 
     // Check if we have enough audio data
-    if (buffer_.size() >= config_.min_audio_duration * 16000) { // Convert seconds to samples
+    float min_samples = config_.min_audio_duration * 16000;
+    if (buffer_.size() >= min_samples) {
         // Check if the last portion is silence
         size_t silence_samples = static_cast<size_t>(config_.silence_duration * 16000);
+        
+        // Ensure we have enough samples for silence detection
+        if (buffer_.size() < silence_samples) {
+            return;
+        }
+        
         std::vector<float> last_samples(buffer_.end() - silence_samples, buffer_.end());
         
+        float last_rms = calculate_rms(last_samples);
+        float buffer_rms = calculate_rms(buffer_);
+        
+        std::cerr << "DEBUG - Buffer: " << buffer_.size() / 16000.0f << "s (" << buffer_rms << " dB), Last " 
+                  << silence_samples / 16000.0f << "s: " << last_rms 
+                  << " dB (threshold: " << config_.silence_threshold << ")" << std::endl;
+        
         if (detect_silence(last_samples)) {
+            std::cerr << "DEBUG - Silence detected!" << std::endl;
+            
             // Check if the entire buffer is too quiet
             if (is_too_quiet(buffer_)) {
+                std::cerr << "DEBUG - Buffer too quiet (" << buffer_rms << " dB < " << config_.min_audio_level << " dB), discarding" << std::endl;
                 buffer_.clear();
                 return;
             }
@@ -252,7 +304,9 @@ void AudioProcessor::process_binary(const std::string& message, websocket::strea
             beast::error_code ec;
             ws.write(boost::asio::buffer(response), ec);
             if (ec) {
-                std::cerr << "Failed to send response: " << ec.message() << std::endl;
+                std::cerr << "Failed to send transcription: " << ec.message() << std::endl;
+            } else {
+                std::cerr << "Sent transcription: " << response << std::endl;
             }
 
             // Clear buffer
@@ -264,16 +318,19 @@ void AudioProcessor::process_binary(const std::string& message, websocket::strea
 std::string AudioProcessor::get_transcription() {
     const int n_samples = buffer_.size();
     if (n_samples == 0) {
+        std::cerr << "DEBUG - No audio data for transcription" << std::endl;
         return "{\"error\":\"no audio data\"}";
     }
 
     int result = whisper_full(ctx_, params_, buffer_.data(), n_samples);
     if (result != 0) {  // whisper_full returns 0 on success
+        std::cerr << "DEBUG - Whisper processing failed with code: " << result << std::endl;
         return "{\"error\":\"failed to process audio\"}";
     }
 
     const int n_segments = whisper_full_n_segments(ctx_);
     if (n_segments <= 0) {
+        std::cerr << "DEBUG - No segments in transcription" << std::endl;
         return "{\"error\":\"no transcription\"}";
     }
 
@@ -320,8 +377,8 @@ void start_websocket_server(
 
     try {
         std::make_shared<Listener>(ioc, endpoint, ctx, params, config)->run();
-        fprintf(stderr, "\nwhisper WebSocket server listening at ws://0.0.0.0:%d\n", port);
+        std::cerr << "\nwhisper WebSocket server listening at ws://0.0.0.0:" << port << std::endl;
     } catch (const std::exception& e) {
-        fprintf(stderr, "Failed to start WebSocket server: %s\n", e.what());
+        std::cerr << "Failed to start WebSocket server: " << e.what() << std::endl;
     }
 }

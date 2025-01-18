@@ -1,4 +1,4 @@
-set(TARGET whisper-server)
+set(TARGET server)
 
 
 # Find Boost
