@@ -345,47 +345,60 @@ void AudioProcessor::update_noise_stats(const std::vector<float>& samples, bool 
 }
 
 std::string AudioProcessor::get_recommended_config() const {
-    if (noise_stats_.speech_samples < 100 || noise_stats_.noise_samples < 5) {
-        return "";  // Not enough data for recommendations
+    if (!config_.auto_settings || noise_stats_.noise_samples < 100) {
+        return "";
     }
 
-    // Calculate optimal silence_threshold:
-    // - Should be between speech_level_avg and noise_level_max
-    // - Closer to speech_level if we have more speech samples
-    float speech_weight = std::min(1.0f, noise_stats_.speech_samples / 500.0f);
-    float silence_threshold = noise_stats_.noise_level_max * (1 - speech_weight) + 
-                            noise_stats_.speech_level_avg * speech_weight;
+    // Calculate recommended settings based on noise statistics
+    float speech_weight = std::min(1.0f, noise_stats_.speech_samples / 1000.0f);
+    float silence_threshold = noise_stats_.background_noise_max * (1 - speech_weight) +
+                            noise_stats_.speech_level * speech_weight;
     
-    // Calculate optimal min_audio_level:
-    // - Should be below speech_level_avg but above noise_level_avg
-    float min_audio_level = (noise_stats_.noise_level_avg + noise_stats_.speech_level_avg) / 2;
-    
-    // Calculate optimal silence_duration:
-    // - Should be proportional to avg_pause_duration but not too long
-    float silence_duration = std::min(0.8f, std::max(0.3f, noise_stats_.avg_pause_duration * 0.8f));
-    
-    // Calculate optimal min_audio_duration:
-    // - Should be proportional to avg_speech_duration
-    float min_audio_duration = std::min(2.0f, std::max(1.0f, noise_stats_.avg_speech_duration * 1.2f));
+    // Add some margin
+    silence_threshold += 3.0f;  // 3 dB margin
 
-    // Build recommendations JSON
-    std::string recommendations = "{\"recommendations\":{" +
-        std::string("\"silence_threshold\":") + std::to_string(silence_threshold) + "," +
-        "\"min_audio_level\":" + std::to_string(min_audio_level) + "," +
-        "\"silence_duration\":" + std::to_string(silence_duration) + "," +
-        "\"min_audio_duration\":" + std::to_string(min_audio_duration) + "," +
-        "\"noise_level_avg\":" + std::to_string(noise_stats_.noise_level_avg) + "," +
-        "\"noise_level_max\":" + std::to_string(noise_stats_.noise_level_max) + "," +
-        "\"noise_level_min\":" + std::to_string(noise_stats_.noise_level_min) + "," +
-        "\"speech_level_avg\":" + std::to_string(noise_stats_.speech_level_avg) + "," +
-        "\"speech_level_max\":" + std::to_string(noise_stats_.speech_level_max) + "," +
-        "\"speech_level_min\":" + std::to_string(noise_stats_.speech_level_min) + "," +
+    float min_audio_level = (noise_stats_.background_noise_level + noise_stats_.speech_level) / 2;
+
+    // Adjust durations based on speech patterns
+    float silence_duration = noise_stats_.avg_pause_duration;
+    if (silence_duration < 0.3f) silence_duration = 0.3f;
+    if (silence_duration > 2.0f) silence_duration = 2.0f;
+
+    float min_audio_duration = noise_stats_.avg_speech_duration;
+    if (min_audio_duration < 1.0f) min_audio_duration = 1.0f;
+    if (min_audio_duration > 5.0f) min_audio_duration = 5.0f;
+
+    // Only recommend changes if they're significantly different
+    bool should_update = 
+        std::abs(silence_threshold - config_.silence_threshold) > 3.0f ||
+        std::abs(min_audio_level - config_.min_audio_level) > 3.0f ||
+        std::abs(silence_duration - config_.silence_duration) > 0.3f ||
+        std::abs(min_audio_duration - config_.min_audio_duration) > 0.3f;
+
+    if (!should_update) {
+        return "";
+    }
+
+    std::string stats = std::string("\"stats\":{") +
         "\"noise_samples\":" + std::to_string(noise_stats_.noise_samples) + "," +
         "\"speech_samples\":" + std::to_string(noise_stats_.speech_samples) + "," +
+        "\"background_noise_level\":" + std::to_string(noise_stats_.background_noise_level) + "," +
+        "\"background_noise_max\":" + std::to_string(noise_stats_.background_noise_max) + "," +
+        "\"background_noise_min\":" + std::to_string(noise_stats_.background_noise_min) + "," +
+        "\"speech_level\":" + std::to_string(noise_stats_.speech_level) + "," +
+        "\"speech_level_max\":" + std::to_string(noise_stats_.speech_level_max) + "," +
+        "\"speech_level_min\":" + std::to_string(noise_stats_.speech_level_min) + "," +
         "\"avg_speech_duration\":" + std::to_string(noise_stats_.avg_speech_duration) + "," +
-        "\"avg_pause_duration\":" + std::to_string(noise_stats_.avg_pause_duration) + "}}";
-
-    return recommendations;
+        "\"avg_pause_duration\":" + std::to_string(noise_stats_.avg_pause_duration) + "," +
+        "\"false_triggers\":" + std::to_string(noise_stats_.false_triggers) + "," +
+        "\"recommended_settings\":{" +
+            "\"silence_threshold\":" + std::to_string(silence_threshold) + "," +
+            "\"min_audio_level\":" + std::to_string(min_audio_level) + "," +
+            "\"silence_duration\":" + std::to_string(silence_duration) + "," +
+            "\"min_audio_duration\":" + std::to_string(min_audio_duration) +
+        "}" +
+    "}";
+    return stats;
 }
 
 void AudioProcessor::reset_noise_stats() {

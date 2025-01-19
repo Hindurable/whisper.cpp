@@ -142,6 +142,7 @@ private:
     std::vector<float> buffer_;
     AudioFormat format_;
     Config config_;
+    bool config_sent_;
     NoiseStats noise_stats_;
     
     // Adaptive settings tracking

@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Whisper.cpp Server</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <style>
+    body {
+        font-family: sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+    }
+    form {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    label {
+        margin-bottom: 0.5rem;
+    }
+    input, select {
+        margin-bottom: 1rem;
+    }
+    button {
+        margin-top: 1rem;
+        padding: 10px 20px;
+        cursor: pointer;
+    }
+    #recordButton {
+        background-color: #4CAF50;
+        color: white;
+        border: none;
+        border-radius: 4px;
+    }
+    #recordButton.recording {
+        background-color: #f44336;
+    }
+    #transcription {
+        width: 100%;
+        min-height: 150px;
+        margin-top: 1rem;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+    }
+    .server-info {
+        background: #f5f5f5;
+        padding: 10px;
+        border-radius: 4px;
+        margin: 1rem 0;
+    }
+    pre {
+        background: #f5f5f5;
+        padding: 10px;
+        border-radius: 4px;
+        overflow-x: auto;
+    }
+    </style>
+</head>
+<body>
+    <h1>Whisper.cpp Server</h1>
+    
+    <div class="server-info">
+        <p>Server listening at http://0.0.0.0:<script>document.write(window.location.port)</script></p>
+        <p>WebSocket endpoint at ws://0.0.0.0:<script>
+            const params = new URLSearchParams(window.location.search);
+            const wsPort = params.get('wsport') || (parseInt(window.location.port) + 1).toString();
+            document.write(wsPort);
+        </script></p>
+    </div>
+
+    <div>
+        <h2>Live Transcription</h2>
+        <button id="recordButton">Start Recording</button>
+        <textarea id="transcription" readonly placeholder="Transcription will appear here..."></textarea>
+    </div>
+
+    <div>
+        <h2>File Upload</h2>
+        <form action="/inference" method="POST" enctype="multipart/form-data">
+            <label for="file">Choose an audio file:</label>
+            <input type="file" id="file" name="file" accept="audio/*" required><br>
+
+            <label for="temperature">Temperature:</label>
+            <input type="number" id="temperature" name="temperature" value="0.0" step="0.01" placeholder="e.g., 0.0"><br>
+
+            <label for="response_format">Response Format:</label>
+            <select id="response_format" name="response_format">
+                <option value="verbose_json">Verbose JSON</option>
+                <option value="json">JSON</option>
+                <option value="text">Text</option>
+                <option value="srt">SRT</option>
+                <option value="vtt">VTT</option>
+            </select><br>
+
+            <button type="submit">Submit</button>
+        </form>
+    </div>
+
+    <h2>API Examples</h2>
+    <h3>/inference</h3>
+    <pre>
+curl 127.0.0.1:<script>document.write(window.location.port)</script>/inference \
+-H "Content-Type: multipart/form-data" \
+-F file="@&lt;file-path&gt;" \
+-F temperature="0.0" \
+-F temperature_inc="0.2" \
+-F response_format="json"
+    </pre>
+
+    <h3>/load</h3>
+    <pre>
+curl 127.0.0.1:<script>document.write(window.location.port)</script>/load \
+-H "Content-Type: multipart/form-data" \
+-F model="&lt;path-to-model-file&gt;"
+    </pre>
+
+    <script>
+    const recordButton = document.getElementById('recordButton');
+    const transcriptionArea = document.getElementById('transcription');
+    let ws = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let isRecording = false;
+
+    function updateButtonState(recording) {
+        isRecording = recording;
+        recordButton.textContent = recording ? 'Stop Recording' : 'Start Recording';
+        if (recording) {
+            recordButton.classList.add('recording');
+        } else {
+            recordButton.classList.remove('recording');
+        }
+    }
+
+    function cleanupResources() {
+        // Stop audio context and media stream
+        if (audioContext) {
+            audioContext.close().catch(console.error);
+            audioContext = null;
+        }
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(track => track.stop());
+            mediaStream = null;
+        }
+        // Update UI
+        updateButtonState(false);
+    }
+
+    async function startRecording() {
+        if (isRecording || ws) {
+            console.log('Already recording or WebSocket exists');
+            return;
+        }
+
+        try {
+            // 1. Setup audio first
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioContext = new AudioContext();
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            // 2. Open WebSocket connection
+            // Get WebSocket port from URL parameter or calculate from HTTP port
+            const params = new URLSearchParams(window.location.search);
+            const wsPort = params.get('wsport') || (parseInt(window.location.port) + 1).toString();
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = protocol + '//' + window.location.hostname + ':' + wsPort + '/';
+            console.log('Opening WebSocket connection to:', wsUrl);
+            ws = new WebSocket(wsUrl);
+
+            // 3. Setup WebSocket handlers
+            ws.onopen = () => {
+                console.log('WebSocket opened, sending settings');
+                // Send audio settings when connection opens
+                const settings = {
+                    'format': 'pcm16',
+                    'auto_settings': true
+                };
+                const settingsStr = JSON.stringify(settings);
+                console.log('Sending settings:', settingsStr);
+                ws.send(settingsStr);
+
+                // Start sending audio only after settings are sent
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN && isRecording) {
+                        const audioData = e.inputBuffer.getChannelData(0);
+                        // Convert Float32Array to Int16Array
+                        const pcm16Data = new Int16Array(audioData.length);
+                        for (let i = 0; i < audioData.length; i++) {
+                            // Convert float32 [-1.0, 1.0] to int16 [-32768, 32767]
+                            const s = Math.max(-1, Math.min(1, audioData[i]));
+                            pcm16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        }
+                        try {
+                            ws.send(pcm16Data.buffer);
+                        } catch (e) {
+                            console.error('Error sending audio data:', e);
+                            stopRecording();
+                        }
+                    }
+                };
+
+                console.log('Starting recording...');
+                updateButtonState(true);
+            };
+
+            ws.onmessage = (event) => {
+                console.log('Received message from server:', event.data);
+                try {
+                    const response = JSON.parse(event.data);
+                    console.log('Parsed server response:', response);
+                    
+                    // Handle direct text response
+                    if (response.text) {
+                        transcriptionArea.value += response.text + '\n';
+                        transcriptionArea.scrollTop = transcriptionArea.scrollHeight;
+                    }
+                    // Handle segmented transcription response
+                    else if (response.type === 'transcription' && response.segments) {
+                        response.segments.forEach(segment => {
+                            transcriptionArea.value += segment.text + '\n';
+                            transcriptionArea.scrollTop = transcriptionArea.scrollHeight;
+                        });
+                    }
+                    // Handle error messages
+                    else if (response.error) {
+                        console.log('Server reported:', response.error);
+                    }
+                } catch (e) {
+                    console.error('Failed to parse server message:', e);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error occurred:', error);
+                stopRecording();
+            };
+
+            ws.onclose = (event) => {
+                console.log('WebSocket connection closed:', {
+                    code: event.code,
+                    reason: event.reason,
+                    wasClean: event.wasClean,
+                    isRecording: isRecording
+                });
+                if (isRecording) {
+                    cleanupResources();
+                }
+                ws = null;
+            };
+
+        } catch (err) {
+            console.error('Error starting recording:', err);
+            alert('Could not start recording: ' + err.message);
+            cleanupResources();
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+    }
+
+    function stopRecording() {
+        console.log('Stopping recording');
+        
+        // Close WebSocket connection first
+        if (ws) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+            ws = null;
+        }
+
+        cleanupResources();
+    }
+
+    recordButton.onclick = async () => {
+        try {
+            if (!isRecording) {
+                await startRecording();
+            } else {
+                stopRecording();
+            }
+        } catch (err) {
+            console.error('Error in button click handler:', err);
+            cleanupResources();
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+    };
+    </script>
+</body>
+</html>
