@@ -345,86 +345,46 @@ void AudioProcessor::update_noise_stats(const std::vector<float>& samples, bool 
 }
 
 std::string AudioProcessor::get_recommended_config() const {
-    if (noise_stats_.noise_samples < 10 || noise_stats_.speech_samples < 10) {
-        return "";  // Not enough data to make recommendations
+    if (noise_stats_.speech_samples < 100 || noise_stats_.noise_samples < 5) {
+        return "";  // Not enough data for recommendations
     }
 
-    // Helper to check if float is valid for JSON
-    auto valid_float = [](float f) -> std::pair<bool, float> {
-        if (std::isnan(f) || std::isinf(f)) {
-            return {false, 0.0f};
-        }
-        return {true, f};
-    };
+    // Calculate optimal silence_threshold:
+    // - Should be between speech_level_avg and noise_level_max
+    // - Closer to speech_level if we have more speech samples
+    float speech_weight = std::min(1.0f, noise_stats_.speech_samples / 500.0f);
+    float silence_threshold = noise_stats_.noise_level_max * (1 - speech_weight) + 
+                            noise_stats_.speech_level_avg * speech_weight;
+    
+    // Calculate optimal min_audio_level:
+    // - Should be below speech_level_avg but above noise_level_avg
+    float min_audio_level = (noise_stats_.noise_level_avg + noise_stats_.speech_level_avg) / 2;
+    
+    // Calculate optimal silence_duration:
+    // - Should be proportional to avg_pause_duration but not too long
+    float silence_duration = std::min(0.8f, std::max(0.3f, noise_stats_.avg_pause_duration * 0.8f));
+    
+    // Calculate optimal min_audio_duration:
+    // - Should be proportional to avg_speech_duration
+    float min_audio_duration = std::min(2.0f, std::max(1.0f, noise_stats_.avg_speech_duration * 1.2f));
 
-    // Calculate silence threshold based on noise statistics
-    float recommended_silence_threshold = -35.0f;  // Default value
-    float recommended_min_audio_level = -55.0f;   // Default value
-    
-    if (auto [valid_noise, noise_level] = valid_float(noise_stats_.background_noise_level); valid_noise) {
-        if (auto [valid_noise_max, noise_max] = valid_float(noise_stats_.background_noise_max); valid_noise_max) {
-            // Use noise max level + margin as threshold
-            float noise_margin = 10.0f;  // dB above maximum noise
-            recommended_silence_threshold = noise_max + noise_margin;
-            
-            // Ensure threshold is not too high compared to average speech
-            if (auto [valid_speech, speech_level] = valid_float(noise_stats_.speech_level); valid_speech) {
-                float min_speech_gap = 15.0f;  // Minimum gap between noise and speech
-                recommended_silence_threshold = std::min(
-                    recommended_silence_threshold,
-                    speech_level - min_speech_gap
-                );
-            }
-            
-            // Set min audio level relative to noise floor
-            recommended_min_audio_level = noise_level + 5.0f;
-        }
-    }
-    
-    // Add some safety margins
-    recommended_silence_threshold = std::clamp(recommended_silence_threshold, -45.0f, -25.0f);
-    recommended_min_audio_level = std::clamp(recommended_min_audio_level, -65.0f, -45.0f);
-    
-    // Validate all float values before adding to JSON
-    std::string recommendations = "{\"recommendations\":{";
-    
-    if (auto [valid, value] = valid_float(recommended_silence_threshold); valid) {
-        recommendations += "\"silence_threshold\":" + std::to_string(value) + ",";
-    } else {
-        recommendations += "\"silence_threshold\":-35.0,"; // Default value
-    }
-    
-    if (auto [valid, value] = valid_float(recommended_min_audio_level); valid) {
-        recommendations += "\"min_audio_level\":" + std::to_string(value) + ",";
-    } else {
-        recommendations += "\"min_audio_level\":-55.0,"; // Default value
-    }
-    
-    // Add all noise statistics for debugging
-    if (auto [valid, value] = valid_float(noise_stats_.background_noise_level); valid) {
-        recommendations += "\"noise_level_avg\":" + std::to_string(value) + ",";
-    }
-    if (auto [valid, value] = valid_float(noise_stats_.background_noise_max); valid) {
-        recommendations += "\"noise_level_max\":" + std::to_string(value) + ",";
-    }
-    if (auto [valid, value] = valid_float(noise_stats_.background_noise_min); valid) {
-        recommendations += "\"noise_level_min\":" + std::to_string(value) + ",";
-    }
-    if (auto [valid, value] = valid_float(noise_stats_.speech_level); valid) {
-        recommendations += "\"speech_level_avg\":" + std::to_string(value) + ",";
-    }
-    if (auto [valid, value] = valid_float(noise_stats_.speech_level_max); valid) {
-        recommendations += "\"speech_level_max\":" + std::to_string(value) + ",";
-    }
-    if (auto [valid, value] = valid_float(noise_stats_.speech_level_min); valid) {
-        recommendations += "\"speech_level_min\":" + std::to_string(value) + ",";
-    }
-    
-    recommendations += 
+    // Build recommendations JSON
+    std::string recommendations = "{\"recommendations\":{" +
+        std::string("\"silence_threshold\":") + std::to_string(silence_threshold) + "," +
+        "\"min_audio_level\":" + std::to_string(min_audio_level) + "," +
+        "\"silence_duration\":" + std::to_string(silence_duration) + "," +
+        "\"min_audio_duration\":" + std::to_string(min_audio_duration) + "," +
+        "\"noise_level_avg\":" + std::to_string(noise_stats_.noise_level_avg) + "," +
+        "\"noise_level_max\":" + std::to_string(noise_stats_.noise_level_max) + "," +
+        "\"noise_level_min\":" + std::to_string(noise_stats_.noise_level_min) + "," +
+        "\"speech_level_avg\":" + std::to_string(noise_stats_.speech_level_avg) + "," +
+        "\"speech_level_max\":" + std::to_string(noise_stats_.speech_level_max) + "," +
+        "\"speech_level_min\":" + std::to_string(noise_stats_.speech_level_min) + "," +
         "\"noise_samples\":" + std::to_string(noise_stats_.noise_samples) + "," +
-        "\"speech_samples\":" + std::to_string(noise_stats_.speech_samples) +
-    "}}";
-    
+        "\"speech_samples\":" + std::to_string(noise_stats_.speech_samples) + "," +
+        "\"avg_speech_duration\":" + std::to_string(noise_stats_.avg_speech_duration) + "," +
+        "\"avg_pause_duration\":" + std::to_string(noise_stats_.avg_pause_duration) + "}}";
+
     return recommendations;
 }
 
@@ -634,6 +594,8 @@ void AudioProcessor::process_binary(const std::string& message, websocket::strea
         response += "}}";
         
         ws.write(boost::asio::buffer(response), ec);
+        std::cout << "Received client settings: " << message << std::endl;
+        std::cout << "Sent acknowledgment: " << response << std::endl;
         config_sent = true;
         return;
     }
@@ -685,9 +647,12 @@ void AudioProcessor::process_binary(const std::string& message, websocket::strea
                 
                 ws.text(true);
                 beast::error_code ec;
+                std::cout << "Generated JSON response: " << response << std::endl;
                 ws.write(boost::asio::buffer(response), ec);
                 if (ec) {
                     std::cerr << "Failed to send transcription: " << ec.message() << std::endl;
+                } else {
+                    std::cout << "Sent transcription: " << response << std::endl;
                 }
 
                 buffer_.clear();
@@ -771,6 +736,8 @@ std::string AudioProcessor::get_transcription() {
     }
 
     float confidence = get_segment_confidence();
+    std::cout << "Transcription confidence: " << confidence << std::endl;
+    
     if (confidence < 0.1f) {  
         return "{\"error\":\"low confidence\"}";
     }
